@@ -20,6 +20,7 @@ from reviewboard.reviews.models.review_request import (ReviewRequest,
 from reviewboard.reviews.models.screenshot_comment import ScreenshotComment
 from reviewboard.reviews.signals import (reply_publishing, reply_published,
                                          review_publishing, review_published)
+import subprocess
 
 
 @python_2_unicode_compatible
@@ -219,6 +220,7 @@ class Review(models.Model):
 
             if self.ship_it:
                 ship_it_value = 1
+                self.send_jira_transition('shipit')
             else:
                 ship_it_value = 0
 
@@ -234,6 +236,19 @@ class Review(models.Model):
 
             review_published.send(sender=self.__class__,
                                   user=user, review=self)
+
+    def send_jira_transition(self, transition):
+        print 'bug list: ', self.review_request.get_bug_list()
+        bug = self.review_request.get_bug_list()[0]
+        urlStr = "http://sjc-dev-usrv48.corp.coupons.com:8080/r/" + str(self.review_request.display_id)
+
+        json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"[JIRA CLIENT]: Code Review Accepted ' + urlStr \
+                   + '\"}}]},\"transition\": {\"id\": \"201\"}}'
+        cmd = "curl -D- -u cliu:87600719 -X POST --data '" + json + \
+                  "' -H \"Content-Type: application/json\" http://sjc-dev-usrv48:8090/rest/api/2/issue/" + bug + "/transitions"
+        print 'cmd = ', cmd
+        ret = subprocess.call([str(cmd)], shell=True)
+        print 'send transition: ', ret
 
     def delete(self):
         """Deletes this review.

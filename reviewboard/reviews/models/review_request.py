@@ -1,6 +1,7 @@
 from __future__ import unicode_literals
 
 import logging
+import subprocess
 
 from django.contrib.auth.models import User
 from django.core.exceptions import ObjectDoesNotExist
@@ -734,12 +735,36 @@ class ReviewRequest(BaseReviewRequestDetails):
             # for the first time. Set the creation timestamp to now.
             self.time_added = timezone.now()
 
+            # make a call to jira api to update status for the new request
+            self.send_jira_transition('start')
+
         self.public = True
         self.save(update_counts=True)
+
+
 
         review_request_published.send(sender=self.__class__, user=user,
                                       review_request=self,
                                       changedesc=changes)
+
+    def send_jira_transition(self, transition):
+        cmd = ''
+        if transition == 'start':
+            print 'bug list: ', self.get_bug_list()
+            bug = self.get_bug_list()[0]
+            urlStr = "http://sjc-dev-usrv48.corp.coupons.com:8080/r/" + str(self.display_id)
+            json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"[JIRA CLIENT]: Start code Review ' +  urlStr \
+                   + '\"}}]},\"transition\": {\"id\": \"211\"}}'
+            cmd = "curl -D- -u cliu:87600719 -X POST --data '" + json + \
+                  "' -H \"Content-Type: application/json\" http://sjc-dev-usrv48:8090/rest/api/2/issue/" + bug +"/transitions"
+            print 'cmd = ', cmd
+        elif transition == 'shipit':
+            json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"[JIRA CLIENT]: Code Review Accepted\"}}]},\"transition\": {\"id\": \"201\"}}'
+            cmd = "curl -D- -u cliu:87600719 -X POST --data '" + json + \
+                  "' -H \"Content-Type: application/json\" http://sjc-dev-usrv48:8090/rest/api/2/issue/HAC-1/transitions"
+            print 'cmd = ', cmd
+        ret = subprocess.call([str(cmd)], shell=True)
+        print 'send transition: ', ret
 
     def _update_counts(self):
         from reviewboard.accounts.models import Profile, LocalSiteProfile
