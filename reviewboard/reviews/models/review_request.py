@@ -758,11 +758,6 @@ class ReviewRequest(BaseReviewRequestDetails):
             cmd = "curl -D- -u cliu:87600719 -X POST --data '" + json + \
                   "' -H \"Content-Type: application/json\" http://sjc-dev-usrv48:8090/rest/api/2/issue/" + bug +"/transitions"
             print 'cmd = ', cmd
-        elif transition == 'shipit':
-            json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"[JIRA CLIENT]: Code Review Accepted\"}}]},\"transition\": {\"id\": \"201\"}}'
-            cmd = "curl -D- -u cliu:87600719 -X POST --data '" + json + \
-                  "' -H \"Content-Type: application/json\" http://sjc-dev-usrv48:8090/rest/api/2/issue/HAC-1/transitions"
-            print 'cmd = ', cmd
         ret = subprocess.call([str(cmd)], shell=True)
         print 'send transition: ', ret
 

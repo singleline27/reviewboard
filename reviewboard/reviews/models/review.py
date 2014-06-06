@@ -221,6 +221,9 @@ class Review(models.Model):
             if self.ship_it:
                 ship_it_value = 1
                 self.send_jira_transition('shipit')
+                # merge the branch if possible
+                self.merge_to_dest_branch()
+
             else:
                 ship_it_value = 0
 
@@ -236,6 +239,21 @@ class Review(models.Model):
 
             review_published.send(sender=self.__class__,
                                   user=user, review=self)
+    def merge_to_dest_branch(self):
+        #src_branch = self.review_request.get_branch()
+        dest_branch = 'hackday'
+        cmd = "curl -H \"Accept: text/x-patch\" -u cliu:87600719 http://sjc-dev-usrv48.corp.coupons.com:8080/api/review-requests/" \
+                    + str(self.review_request.display_id) + "/diffs/" + str(len(self.review_request.get_diffsets())) + "/ > /tmp/tmp.diff"
+        subprocess.call([str(cmd)], shell=True)
+
+        print(subprocess.call(['cd /home/cliu/hg/CCWeb/;' + 'hg pull;' + 'hg checkout ' + dest_branch + ';'
+                               + "hg patch /tmp/tmp.diff -m 'merge from reviewboard client'"], shell=True))
+        #print(subprocess.call(['hg pull'], shell=True))
+        #print(subprocess.call(['hg checkout ' + dest_branch], shell=True))
+        #merge_cmd = "hg patch /tmp/tmp.diff -m 'merge from reviewboard client'"
+        #print(subprocess.call([merge_cmd], shell=True))
+        #print(subprocess.call(['cd ' + str(cur_pwd)], shell=True))
+
 
     def send_jira_transition(self, transition):
         print 'bug list: ', self.review_request.get_bug_list()

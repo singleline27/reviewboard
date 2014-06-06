@@ -55,6 +55,9 @@ class BaseReviewRequestDetails(models.Model):
 
         return bugs
 
+    def get_branch(self):
+        return self.branch
+
     def get_screenshots(self):
         """Returns the list of all screenshots on a review request.
 
