@@ -241,12 +241,13 @@ class Review(models.Model):
                                   user=user, review=self)
     def merge_to_dest_branch(self):
         #src_branch = self.review_request.get_branch()
-        dest_branch = 'hackday'
-        cmd = "curl -H \"Accept: text/x-patch\" -u cliu:87600719 http://sjc-dev-usrv48.corp.coupons.com:8080/api/review-requests/" \
-                    + str(self.review_request.display_id) + "/diffs/" + str(len(self.review_request.get_diffsets())) + "/ > /tmp/tmp.diff"
-        subprocess.call([str(cmd)], shell=True)
+        #dest_branch = 'hackday'
+        #cmd = "curl -H \"Accept: text/x-patch\" -u cliu:87600719 http://sjc-dev-usrv48.corp.coupons.com:8080/api/review-requests/" \
+        #            + str(self.review_request.display_id) + "/diffs/" + str(len(self.review_request.get_diffsets())) + "/ > /tmp/tmp.diff"
 
-        print(subprocess.call(['cd /home/cliu/hg/CCWeb/;' + 'hg pull;' + 'hg checkout ' + dest_branch + ';'
+        #subprocess.call([str(cmd)], shell=True)
+
+        print(subprocess.call(['cd /home/cliu/hg/CCWeb/;hg revert -a;hg diff -r hackday:hackday_2 > /tmp/tmp.diff;' + 'hg pull;' + 'hg checkout hackday;'
                                + "hg patch /tmp/tmp.diff -m 'merge from reviewboard client'"], shell=True))
         #print(subprocess.call(['hg pull'], shell=True))
         #print(subprocess.call(['hg checkout ' + dest_branch], shell=True))
@@ -260,8 +261,8 @@ class Review(models.Model):
         bug = self.review_request.get_bug_list()[0]
         urlStr = "http://sjc-dev-usrv48.corp.coupons.com:8080/r/" + str(self.review_request.display_id)
 
-        json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"[JIRA CLIENT]: Code Review Accepted ' + urlStr \
-                   + '\"}}]},\"transition\": {\"id\": \"201\"}}'
+        json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"{color:green}[JIRA CLIENT]: Code Review Accepted ' + urlStr \
+                   + '{color}\"}}]},\"transition\": {\"id\": \"201\"}}'
         cmd = "curl -D- -u cliu:87600719 -X POST --data '" + json + \
                   "' -H \"Content-Type: application/json\" http://sjc-dev-usrv48:8090/rest/api/2/issue/" + bug + "/transitions"
         print 'cmd = ', cmd

@@ -753,8 +753,8 @@ class ReviewRequest(BaseReviewRequestDetails):
             print 'bug list: ', self.get_bug_list()
             bug = self.get_bug_list()[0]
             urlStr = "http://sjc-dev-usrv48.corp.coupons.com:8080/r/" + str(self.display_id)
-            json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"[JIRA CLIENT]: Start code Review ' +  urlStr \
-                   + '\"}}]},\"transition\": {\"id\": \"211\"}}'
+            json = '{\"update\": {\"comment\": [{\"add\": {\"body\": \"{color:brown}[JIRA CLIENT]: Start code Review ' +  urlStr \
+                   + '{color}\"}}]},\"transition\": {\"id\": \"211\"}}'
             cmd = "curl -D- -u cliu:87600719 -X POST --data '" + json + \
                   "' -H \"Content-Type: application/json\" http://sjc-dev-usrv48:8090/rest/api/2/issue/" + bug +"/transitions"
             print 'cmd = ', cmd
