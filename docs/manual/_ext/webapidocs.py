@@ -15,8 +15,8 @@ from django.contrib.auth.models import User
 from django.http import HttpRequest
 from django.template.defaultfilters import title
 from djblets.util.http import is_mimetype_a
-from djblets.webapi.core import WebAPIResponseError
 from djblets.webapi.resources import get_resource_from_class, WebAPIResource
+from djblets.webapi.responses import WebAPIResponseError
 from docutils import nodes
 from docutils.parsers.rst import directives
 from docutils.statemachine import ViewList
@@ -72,6 +72,10 @@ class DummyRequest(HttpRequest):
         self.method = 'GET'
         self.path = ''
         self.user = User.objects.all()[0]
+
+        # This is normally set internally by Djblets, but we don't
+        # go through the standard __call__ flow.
+        self._djblets_webapi_object_cache = {}
 
     def build_absolute_uri(self, location=None):
         if not self.path and not location:

@@ -27,10 +27,29 @@ def _compare_item(self, item_rsp, hosting_service):
     self.assertEqual(item_rsp['supported_scmtools'],
                      hosting_service.supported_scmtools)
 
+    # Compute the base URL for links.
+    url_base = 'http://testserver/'
+
+    if '/s/local-site-1/' in item_rsp['links']['self']['href']:
+        url_base += 's/local-site-1/'
+
+    url_base += 'api/'
+
+    # Check the links.
+    accounts_url = url_base + ('hosting-service-accounts/?service=%s'
+                               % hosting_service.id)
+    self.assertIn('accounts', item_rsp['links'])
+    self.assertEqual(item_rsp['links']['accounts']['href'], accounts_url)
+
+    accounts_url = url_base + ('repositories/?hosting-service=%s'
+                               % hosting_service.id)
+    self.assertIn('repositories', item_rsp['links'])
+    self.assertEqual(item_rsp['links']['repositories']['href'], accounts_url)
+
 
 @six.add_metaclass(BasicTestsMetaclass)
 class ResourceListTests(BaseWebAPITestCase):
-    """Testing the HostingService list APIs."""
+    """Testing the HostingServiceResource list APIs."""
     fixtures = ['test_users']
     sample_api_url = 'hosting-services/'
     resource = resources.hosting_service
@@ -53,7 +72,7 @@ class ResourceListTests(BaseWebAPITestCase):
 
 @six.add_metaclass(BasicTestsMetaclass)
 class ResourceItemTests(BaseWebAPITestCase):
-    """Testing the HostingService item APIs."""
+    """Testing the HostingServiceResource item APIs."""
     fixtures = ['test_users']
     sample_api_url = 'hosting-services/<id>/'
     resource = resources.hosting_service

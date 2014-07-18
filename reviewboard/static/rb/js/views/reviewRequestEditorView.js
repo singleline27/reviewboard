@@ -269,14 +269,22 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
             useEditIconOnly: true,
             formatter: function(view, data, $el) {
                 var reviewRequest = view.model.get('reviewRequest'),
-                    bugTrackerURL = reviewRequest.get('bugTrackerURL');
+                    bugTrackerURL = reviewRequest.get('bugTrackerURL'),
+                    bugList,
+                    $bugList;
 
                 data = data || [];
 
                 if (bugTrackerURL) {
-                    $el.html(view.urlizeList(data, function(item) {
-                        return bugTrackerURL.replace('%s', item);
-                    }, _.escape));
+                    bugList = view.urlizeList(data, function(item) {
+                        return bugTrackerURL.replace('--bug_id--', item);
+                    });
+
+                    $bugList = $(bugList)
+                        .addClass('bug')
+                        .bug_infobox();
+
+                    $el.html($bugList);
                 } else {
                     $el.text(data.join(", "));
                 }
@@ -384,7 +392,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
     initialize: function() {
         var $issueSummary = $('#issue-summary');
 
-        _.bindAll(this, '_resizeLayout');
+        _.bindAll(this, '_checkResizeLayout');
 
         this._fieldEditors = {};
         this._hasFields = (this.$('.editable').length > 0);
@@ -545,9 +553,9 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
              * Update the layout constraints any time these properties
              * change. Also, right away.
              */
-            $(window).resize(this._resizeLayout);
-            this.listenTo(this.model, 'change:editCount', this._resizeLayout);
-            this._resizeLayout();
+            $(window).resize(this._checkResizeLayout);
+            this.listenTo(this.model, 'change:editCount', this._checkResizeLayout);
+            this._checkResizeLayout();
 
             if (this.issueSummaryTableView) {
                 this.issueSummaryTableView.render();
@@ -699,7 +707,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
         if (fields.length === 0) {
             this.model.publishDraft();
         } else {
-            fields.inlineEditor("save");
+            fields.inlineEditor("submit");
         }
     },
 
@@ -750,7 +758,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
 
         RB.formatText($el, text || '', reviewRequest.get('bugTrackerURL'));
 
-        $el.find('img').load(this._resizeLayout);
+        $el.find('img').load(this._checkResizeLayout);
     },
 
     /*
@@ -971,7 +979,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
                         }, fieldOptions),
                         this);
                 }, this),
-                resize: this._resizeLayout
+                resize: this._checkResizeLayout
             });
 
         this.listenTo(
@@ -1069,6 +1077,21 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
     },
 
     /*
+     * Wrapper for _resizeLayout that verifies that there's actually a layout
+     * to resize.
+     */
+    _checkResizeLayout: function() {
+        /*
+         * Not every page that uses this has a #review_request_main element
+         * (for instance, review UIs want to have the draft banners but not
+         * the review request box). In this case, just skip all of this.
+         */
+        if (this._$main.length !== 0) {
+            this._resizeLayout();
+        }
+    },
+
+    /*
      * Resizes the layout in response to size or position changes of fields.
      *
      * This will spread out the main text fields to cover the full height of
@@ -1084,6 +1107,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
             editor = $field.data('markdown-editor'),
             contentHeight,
             height;
+
 
         /*
          * Reset all the heights so we can do calculations based on their
@@ -1149,7 +1173,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
      * Schedules a layout resize after the stack unwinds.
      */
     _scheduleResizeLayout: function() {
-        _.defer(this._resizeLayout);
+        _.defer(this._checkResizeLayout);
     },
 
     /*

@@ -11,6 +11,7 @@ from django.conf import settings
 from django.conf.urls import patterns, url
 from django.contrib.sites.models import Site
 from django.core.cache import cache
+from django.core.exceptions import ObjectDoesNotExist
 from django.http import HttpResponse
 from django.utils import six
 from django.utils.six.moves.urllib.error import HTTPError, URLError
@@ -18,6 +19,7 @@ from django.utils.translation import ugettext_lazy as _
 from django.views.decorators.http import require_POST
 from djblets.siteconfig.models import SiteConfiguration
 
+from reviewboard.hostingsvcs.bugtracker import BugTracker
 from reviewboard.hostingsvcs.errors import (AuthorizationError,
                                             HostingServiceError,
                                             InvalidPlanError,
@@ -28,9 +30,11 @@ from reviewboard.hostingsvcs.hook_utils import (close_all_review_requests,
                                                 get_git_branch_name,
                                                 get_review_request_id,
                                                 get_server_url)
-from reviewboard.hostingsvcs.repository import HostingServiceRepository
+from reviewboard.hostingsvcs.repository import RemoteRepository
 from reviewboard.hostingsvcs.service import (HostingService,
                                              HostingServiceClient)
+from reviewboard.hostingsvcs.utils.paginator import (APIPaginator,
+                                                     ProxyPaginator)
 from reviewboard.scmtools.core import Branch, Commit
 from reviewboard.scmtools.errors import FileNotFoundError, SCMError
 from reviewboard.site.urlresolvers import local_site_reverse
@@ -98,10 +102,39 @@ class GitHubPrivateOrgForm(HostingServiceForm):
                     'http://github.com/&lt;org_name&gt;/&lt;repo_name&gt;/'))
 
 
+class GitHubAPIPaginator(APIPaginator):
+    """Paginates over GitHub API list resources.
+
+    This is returned by some GitHubClient functions in order to handle
+    iteration over pages of results, without resorting to fetching all
+    pages at once or baking pagination into the functions themselves.
+    """
+    start_query_param = 'page'
+    per_page_query_param = 'per_page'
+
+    LINK_RE = re.compile(r'\<(?P<url>[^>]+)\>; rel="(?P<rel>[^"]+)",? *')
+
+    def fetch_url(self, url):
+        """Fetches the page data from a URL."""
+        data, headers = self.client.api_get(url, return_headers=True)
+
+        # Find all the links in the Link header and key off by the link
+        # name ('prev', 'next', etc.).
+        links = dict(
+            (m.group('rel'), m.group('url'))
+            for m in self.LINK_RE.finditer(headers.get('Link', ''))
+        )
+
+        return {
+            'data': data,
+            'headers': headers,
+            'prev_url': links.get('prev'),
+            'next_url': links.get('next'),
+        }
+
+
 class GitHubClient(HostingServiceClient):
     RAW_MIMETYPE = 'application/vnd.github.v3.raw'
-
-    NEXT_LINK_RE = re.compile(r'\<(?P<link>.+)\>(?=; rel="next")')
 
     def __init__(self, hosting_service):
         super(GitHubClient, self).__init__(hosting_service)
@@ -157,26 +190,22 @@ class GitHubClient(HostingServiceClient):
         except (URLError, HTTPError) as e:
             self._check_api_error(e)
 
-    def api_get_list(self, url, return_headers=False, *args, **kwargs):
-        """Performs an HTTP GET to a GitHub list API and yields the results.
+    def api_get_list(self, url, start=None, per_page=None, *args, **kwargs):
+        """Performs an HTTP GET to a GitHub API and returns a paginator.
 
-        This will follow all "next" links provided by the API, yielding each
-        page of data. In this case, it works as a generator.
+        This returns a GitHubAPIPaginator that's used to iterate over the
+        pages of results. Each page contains information on the data and
+        headers from that given page.
 
-        If `return_headers` is True, then each page of results will be
-        yielded as a tuple of (data, headers). Otherwise, just the data
-        will be yielded.
+        The ``start`` and ``per_page`` parameters can be used to control
+        where pagination begins and how many results are returned per page.
+        ``start`` is a 0-based index representing a page number.
         """
-        while url:
-            data, headers = self.api_get(url, return_headers=True,
-                                         *args, **kwargs)
+        if start is not None:
+            # GitHub uses 1-based indexing, so add one.
+            start += 1
 
-            if return_headers:
-                yield data, headers
-            else:
-                yield data
-
-            url = self._get_next_link(headers)
+        return GitHubAPIPaginator(self, url, start=start, per_page=per_page)
 
     def api_post(self, url, *args, **kwargs):
         try:
@@ -247,21 +276,50 @@ class GitHubClient(HostingServiceClient):
                             url, e, exc_info=1)
             raise SCMError(six.text_type(e))
 
-    def api_get_remote_repositories(self, api_url, owner, plan):
+    def api_get_issue(self, repo_api_url, issue_id):
+        url = self._build_api_url(repo_api_url, 'issues/%s' % issue_id)
+
+        try:
+            return self.api_get(url)
+        except Exception as e:
+            logging.warning('GitHub: Failed to fetch issue from %s: %s',
+                            url, e, exc_info=1)
+            raise SCMError(six.text_type(e))
+
+    def api_get_remote_repositories(self, api_url, owner, owner_type,
+                                    filter_type=None, start=None,
+                                    per_page=None):
         url = api_url
 
-        if plan.endswith('org'):
+        if owner_type == 'organization':
             url += 'orgs/%s/repos' % owner
-        elif owner == self.account.username:
-            # All repositories belonging to an authenticated user.
-            url += 'user/repos'
+        elif owner_type == 'user':
+            if owner == self.account.username:
+                # All repositories belonging to an authenticated user.
+                url += 'user/repos'
+            else:
+                # Only public repositories for the user.
+                url += 'users/%s/repos' % owner
         else:
-            # Only public repositories for the user.
-            url += 'users/%s/repos?type=all' % owner
+            raise ValueError(
+                "owner_type must be 'organization' or 'user', not %r'"
+                % owner_type)
 
-        for data in self.api_get_list(self._build_api_url(url)):
-            for repo_data in data:
-                yield repo_data
+        if filter_type:
+            url += '?type=%s' % (filter_type or 'all')
+
+        return self.api_get_list(self._build_api_url(url),
+                                 start=start, per_page=per_page)
+
+    def api_get_remote_repository(self, api_url, owner, repository_id):
+        try:
+            return self.api_get(self._build_api_url(
+                '%srepos/%s/%s' % (api_url, owner, repository_id)))
+        except HostingServiceError as e:
+            if e.http_code == 404:
+                return None
+            else:
+                raise
 
     def api_get_tree(self, repo_api_url, sha, recursive=False):
         url = self._build_api_url(repo_api_url, 'git/trees/%s' % sha)
@@ -292,18 +350,6 @@ class GitHubClient(HostingServiceClient):
 
         return url
 
-    def _get_next_link(self, headers):
-        """Return the next link extracted from the Links in headers.
-
-        This is used to traverse a paginated response by one of the
-        API pagination functions.
-        """
-        try:
-            links = headers.get('Link')
-            return self.NEXT_LINK_RE.match(links).group('link')
-        except (KeyError, AttributeError, TypeError):
-            return None
-
     def _check_rate_limits(self, headers):
         rate_limit_remaining = headers.get('X-RateLimit-Remaining', None)
 
@@ -330,17 +376,18 @@ class GitHubClient(HostingServiceClient):
             if x_github_otp.startswith('required;'):
                 raise TwoFactorAuthCodeRequiredError(
                     _('Enter your two-factor authentication code. '
-                      'This code will be sent to you by GitHub.'))
+                      'This code will be sent to you by GitHub.'),
+                    http_code=e.code)
 
             if e.code == 401:
-                raise AuthorizationError(rsp['message'])
+                raise AuthorizationError(rsp['message'], http_code=e.code)
 
-            raise HostingServiceError(rsp['message'])
+            raise HostingServiceError(rsp['message'], http_code=e.code)
         else:
-            raise HostingServiceError(six.text_type(e))
+            raise HostingServiceError(six.text_type(e), http_code=e.code)
 
 
-class GitHub(HostingService):
+class GitHub(HostingService, BugTracker):
     name = _('GitHub')
     plans = [
         ('public', {
@@ -413,6 +460,7 @@ class GitHub(HostingService):
     supports_post_commit = True
     supports_repositories = True
     supports_two_factor_auth = True
+    supports_list_remote_repositories = True
     supported_scmtools = ['Git']
 
     client_class = GitHubClient
@@ -458,8 +506,8 @@ class GitHub(HostingService):
                     self._get_repo_api_url_raw(
                         self._get_repository_owner_raw(plan, kwargs),
                         self._get_repository_name_raw(plan, kwargs))))
-        except Exception as e:
-            if six.text_type(e) == 'Not Found':
+        except HostingServiceError as e:
+            if e.http_code == 404:
                 if plan in ('public', 'private'):
                     raise RepositoryError(
                         _('A repository with this name was not found, or your '
@@ -616,9 +664,9 @@ class GitHub(HostingService):
                         password=password,
                         two_factor_auth_code=two_factor_auth_code)
                 except HostingServiceError as e:
-                    # If we get a Not Found, then the authorization was
+                    # If we get a 404 Not Found, then the authorization was
                     # probably already deleted.
-                    if six.text_type(e) != 'Not Found':
+                    if e.http_code != 404:
                         raise
 
                 self.account.data['authorization'] = ''
@@ -657,12 +705,13 @@ class GitHub(HostingService):
         results = []
         for ref in refs:
             name = ref['ref'][len('refs/heads/'):]
-            results.append(Branch(name, ref['object']['sha'],
+            results.append(Branch(id=name,
+                                  commit=ref['object']['sha'],
                                   default=(name == 'master')))
 
         return results
 
-    def get_commits(self, repository, start=None):
+    def get_commits(self, repository, branch=None, start=None):
         repo_api_url = self._get_repo_api_url(repository)
         commits = self.client.api_get_commits(repo_api_url, start=start)
 
@@ -756,7 +805,8 @@ class GitHub(HostingService):
         return Commit(author_name, revision, date, message, parent_revision,
                       diff=diff)
 
-    def get_remote_repositories(self, owner, plan=None):
+    def get_remote_repositories(self, owner=None, owner_type='user',
+                                filter_type=None, start=None, per_page=None):
         """Return a list of remote repositories matching the given criteria.
 
         This will look up each remote repository on GitHub that the given
@@ -774,19 +824,84 @@ class GitHub(HostingService):
         Otherwise, `owner` is assumed to be another GitHub user, and their
         accessible repositories that they own or are a member of will be
         returned.
+
+        `owner` defaults to the linked account's username, and `plan`
+        defaults to 'public'.
         """
-        if plan not in ('public', 'private', 'public-org', 'private-org'):
-            raise InvalidPlanError(plan)
+        if owner is None and owner_type == 'user':
+            owner = self.account.username
+
+        assert owner
 
         url = self.get_api_url(self.account.hosting_url)
+        paginator = self.client.api_get_remote_repositories(
+            url, owner, owner_type, filter_type, start, per_page)
 
-        for repo in self.client.api_get_remote_repositories(url, owner, plan):
-            yield HostingServiceRepository(name=repo['name'],
-                                           owner=repo['owner']['login'],
-                                           scm_type='Git',
-                                           path=repo['url'],
-                                           mirror_path=repo['mirror_url'],
-                                           extra_data=repo)
+        return ProxyPaginator(
+            paginator,
+            normalize_page_data_func=lambda page_data: [
+                RemoteRepository(
+                    self,
+                    repository_id='%s/%s' % (repo['owner']['login'],
+                                             repo['name']),
+                    name=repo['name'],
+                    owner=repo['owner']['login'],
+                    scm_type='Git',
+                    path=repo['clone_url'],
+                    mirror_path=repo['mirror_url'],
+                    extra_data=repo)
+                for repo in page_data
+            ])
+
+    def get_remote_repository(self, repository_id):
+        """Get the remote repository for the ID.
+
+        The ID is expected to be an ID returned from get_remote_repositories(),
+        in the form of "owner/repo_id".
+
+        If the repository is not found, ObjectDoesNotExist will be raised.
+        """
+        parts = repository_id.split('/')
+        repo = None
+
+        if len(parts) == 2:
+            repo = self.client.api_get_remote_repository(
+                self.get_api_url(self.account.hosting_url),
+                *parts)
+
+        if not repo:
+            raise ObjectDoesNotExist
+
+        return RemoteRepository(self,
+                                repository_id=repository_id,
+                                name=repo['name'],
+                                owner=repo['owner']['login'],
+                                scm_type='Git',
+                                path=repo['clone_url'],
+                                mirror_path=repo['mirror_url'],
+                                extra_data=repo)
+
+    def get_bug_info_uncached(self, repository, bug_id):
+        """Get the bug info from the server."""
+        result = {
+            'summary': '',
+            'description': '',
+            'status': '',
+        }
+
+        repo_api_url = self._get_repo_api_url(repository)
+        try:
+            issue = self.client.api_get_issue(repo_api_url, bug_id)
+            result = {
+                'summary': issue['title'],
+                'description': issue['body'],
+                'status': issue['state'],
+            }
+        except:
+            # Errors in fetching are already logged in api_get_issue
+            pass
+
+        return result
 
     def _reset_authorization(self, client_id, client_secret, token):
         """Resets the authorization info for an OAuth app-linked token.

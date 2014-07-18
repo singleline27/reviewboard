@@ -170,6 +170,8 @@ class HostingService(object):
     supports_repositories = False
     supports_ssh_key_association = False
     supports_two_factor_auth = False
+    supports_list_remote_repositories = False
+
     self_hosted = False
     repository_url_patterns = None
 
@@ -271,7 +273,7 @@ class HostingService(object):
         """
         raise NotImplementedError
 
-    def get_commits(self, repository, start=None):
+    def get_commits(self, repository, branch=None, start=None):
         """Get a list of commits backward in history from a given point.
 
         This should be implemented by subclasses, and is expected to return a
@@ -292,11 +294,32 @@ class HostingService(object):
         """
         raise NotImplementedError
 
-    def get_remote_repositories(self, owner, plan=None):
-        """Get a list of remote repositories for the owner and plan.
+    def get_remote_repositories(self, owner=None, owner_type=None,
+                                filter_type=None, start=None, per_page=None):
+        """Get a list of remote repositories for the owner.
 
-        This should be implemented by subclasses, and is expected to return a
-        list of HostingServiceRepository objects.
+        This should be implemented by subclasses, and is expected to return an
+        APIPaginator providing pages of RemoteRepository objects.
+
+        The ``start`` and ``per_page`` parameters can be used to control
+        where pagination begins and how many results are returned per page,
+        if the subclass supports it.
+
+        ``owner`` is expected to default to a reasonable value (typically
+        the linked account's username). The hosting service may also require
+        an ``owner_type`` value that identifies what the ``owner`` means.
+        This value is specific to the hosting service backend.
+
+        Likewise, ``filter_type`` is specific to the hosting service backend.
+        If supported, it may be used to filter the types of hosting services.
+        """
+        raise NotImplementedError
+
+    def get_remote_repository(self, repository_id):
+        """Get the remote repository for the ID.
+
+        This should be implemented by subclasses, and is expected to return
+        a RemoteRepository if found, or raise ObjectDoesNotExist if not found.
         """
         raise NotImplementedError
 

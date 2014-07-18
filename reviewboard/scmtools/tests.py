@@ -8,6 +8,7 @@ from socket import error as SocketError
 from tempfile import mkdtemp
 
 from django import forms
+from django.conf import settings
 from django.contrib.auth.models import AnonymousUser, User
 from django.core.cache import cache
 from django.utils import six
@@ -35,6 +36,7 @@ from reviewboard.scmtools.perforce import STunnelProxy, STUNNEL_SERVER
 from reviewboard.scmtools.signals import (checked_file_exists,
                                           checking_file_exists,
                                           fetched_file, fetching_file)
+from reviewboard.scmtools.svn import recompute_svn_backend
 from reviewboard.site.models import LocalSite
 from reviewboard.ssh.client import SSHClient
 from reviewboard.ssh.tests import SSHTestCase
@@ -161,9 +163,10 @@ class RepositoryTests(TestCase):
 
         self.local_repo_path = os.path.join(os.path.dirname(__file__),
                                             'testdata', 'git_repo')
-        self.repository = Repository(name='Git test repo',
-                                     path=self.local_repo_path,
-                                     tool=Tool.objects.get(name='Git'))
+        self.repository = Repository.objects.create(
+            name='Git test repo',
+            path=self.local_repo_path,
+            tool=Tool.objects.get(name='Git'))
 
         self.scmtool_cls = self.repository.get_scmtool().__class__
         self.old_get_file = self.scmtool_cls.get_file
@@ -176,6 +179,36 @@ class RepositoryTests(TestCase):
 
         self.scmtool_cls.get_file = self.old_get_file
         self.scmtool_cls.file_exists = self.old_file_exists
+
+    def test_archive(self):
+        """Testing Repository.archive"""
+        self.repository.archive()
+        self.assertTrue(self.repository.name.startswith('ar:Git test repo:'))
+        self.assertTrue(self.repository.archived)
+        self.assertFalse(self.repository.public)
+        self.assertIsNotNone(self.repository.archived_timestamp)
+
+        repository = Repository.objects.get(pk=self.repository.pk)
+        self.assertEqual(repository.name, self.repository.name)
+        self.assertEqual(repository.archived, self.repository.archived)
+        self.assertEqual(repository.public, self.repository.public)
+        self.assertEqual(repository.archived_timestamp,
+                         self.repository.archived_timestamp)
+
+    def test_archive_no_save(self):
+        """Testing Repository.archive with save=False"""
+        self.repository.archive(save=False)
+        self.assertTrue(self.repository.name.startswith('ar:Git test repo:'))
+        self.assertTrue(self.repository.archived)
+        self.assertFalse(self.repository.public)
+        self.assertIsNotNone(self.repository.archived_timestamp)
+
+        repository = Repository.objects.get(pk=self.repository.pk)
+        self.assertNotEqual(repository.name, self.repository.name)
+        self.assertNotEqual(repository.archived, self.repository.archived)
+        self.assertNotEqual(repository.public, self.repository.public)
+        self.assertNotEqual(repository.archived_timestamp,
+                            self.repository.archived_timestamp)
 
     def test_get_file_caching(self):
         """Testing Repository.get_file caches result"""
@@ -393,29 +426,81 @@ class CVSTests(SCMTestCase):
         except ImportError:
             raise nose.SkipTest('cvs binary not found')
 
-    def test_path_with_port(self):
-        """Testing parsing a CVSROOT with a port"""
-        repo = Repository(name="CVS",
-                          path="example.com:123/cvsroot/test",
-                          username="anonymous",
-                          tool=Tool.objects.get(name="CVS"))
-        tool = repo.get_scmtool()
-
-        self.assertEqual(tool.repopath, "/cvsroot/test")
-        self.assertEqual(tool.client.cvsroot,
-                         ":pserver:anonymous@example.com:123/cvsroot/test")
+    def test_build_cvsroot_with_port(self):
+        """Testing CVSTool.build_cvsroot with a port"""
+        self._test_build_cvsroot(
+            repo_path='example.com:123/cvsroot/test',
+            username='anonymous',
+            expected_cvsroot=':pserver:anonymous@example.com:123/cvsroot/test',
+            expected_path='/cvsroot/test')
 
     def test_path_without_port(self):
-        """Testing parsing a CVSROOT without a port"""
-        repo = Repository(name="CVS",
-                          path="example.com:/cvsroot/test",
-                          username="anonymous",
-                          tool=Tool.objects.get(name="CVS"))
-        tool = repo.get_scmtool()
+        """Testing CVSTool.build_cvsroot without a port"""
+        self._test_build_cvsroot(
+            repo_path='example.com:/cvsroot/test',
+            username='anonymous',
+            expected_cvsroot=':pserver:anonymous@example.com:/cvsroot/test',
+            expected_path='/cvsroot/test')
 
-        self.assertEqual(tool.repopath, "/cvsroot/test")
-        self.assertEqual(tool.client.cvsroot,
-                         ":pserver:anonymous@example.com:/cvsroot/test")
+    def test_path_with_pserver_and_no_user_or_password(self):
+        """Testing CVSTool.build_cvsroot with :pserver: and no user or
+        password
+        """
+        self._test_build_cvsroot(
+            repo_path=':pserver:example.com:/cvsroot/test',
+            expected_cvsroot=':pserver:example.com:/cvsroot/test',
+            expected_path='/cvsroot/test')
+
+    def test_path_with_pserver_and_inline_user(self):
+        """Testing CVSTool.build_cvsroot with :pserver: and inline user"""
+        self._test_build_cvsroot(
+            repo_path=':pserver:anonymous@example.com:/cvsroot/test',
+            expected_cvsroot=':pserver:anonymous@example.com:/cvsroot/test',
+            expected_path='/cvsroot/test')
+
+    def test_path_with_pserver_and_inline_user_and_password(self):
+        """Testing CVSTool.build_cvsroot with :pserver: and inline user and
+        password
+        """
+        self._test_build_cvsroot(
+            repo_path=':pserver:anonymous:pass@example.com:/cvsroot/test',
+            expected_cvsroot=':pserver:anonymous:pass@example.com:'
+                             '/cvsroot/test',
+            expected_path='/cvsroot/test')
+
+    def test_path_with_pserver_and_form_user(self):
+        """Testing CVSTool.build_cvsroot with :pserver: and form-provided
+        user
+        """
+        self._test_build_cvsroot(
+            repo_path=':pserver:example.com:/cvsroot/test',
+            username='anonymous',
+            expected_cvsroot=':pserver:anonymous@example.com:/cvsroot/test',
+            expected_path='/cvsroot/test')
+
+    def test_path_with_pserver_and_form_user_and_password(self):
+        """Testing CVSTool.build_cvsroot with :pserver: and form-provided
+        user and password
+        """
+        self._test_build_cvsroot(
+            repo_path=':pserver:example.com:/cvsroot/test',
+            username='anonymous',
+            password='pass',
+            expected_cvsroot=':pserver:anonymous:pass@example.com:'
+                             '/cvsroot/test',
+            expected_path='/cvsroot/test')
+
+    def test_path_with_pserver_and_inline_takes_precedence(self):
+        """Testing CVSTool.build_cvsroot with :pserver: and inline user/password
+        taking precedence
+        """
+        self._test_build_cvsroot(
+            repo_path=':pserver:anonymous:pass@example.com:/cvsroot/test',
+            username='grumpy',
+            password='grr',
+            expected_cvsroot=':pserver:anonymous:pass@example.com:'
+                             '/cvsroot/test',
+            expected_path='/cvsroot/test')
 
     def test_get_file(self):
         """Testing CVSTool.get_file"""
@@ -447,7 +532,7 @@ class CVSTests(SCMTestCase):
                           lambda: self.tool.get_file('hello', PRE_CREATION))
 
     def test_revision_parsing(self):
-        """Testing revision number parsing"""
+        """Testing CVSTool revision number parsing"""
         self.assertEqual(self.tool.parse_diff_revision('', 'PRE-CREATION')[1],
                          PRE_CREATION)
         self.assertEqual(
@@ -614,7 +699,7 @@ class CVSTests(SCMTestCase):
         self.assertEqual(file.delete_count, 1)
 
     def test_bad_root(self):
-        """Testing a bad CVSROOT"""
+        """Testing CVSTool with a bad CVSROOT"""
         file = 'test/testfile'
         rev = Revision('1.1')
         badrepo = Repository(name='CVS',
@@ -632,13 +717,31 @@ class CVSTests(SCMTestCase):
         """Testing a SSH-backed CVS repository with a LocalSite"""
         self._test_ssh_with_site(self.cvs_ssh_path, 'CVSROOT/modules')
 
+    def _test_build_cvsroot(self, repo_path, expected_cvsroot, expected_path,
+                            username=None, password=None):
+        cvsroot, norm_path = self.tool.build_cvsroot(repo_path, username,
+                                                     password)
 
-class SubversionTests(SCMTestCase):
-    """Unit tests for subversion."""
+        self.assertEqual(cvsroot, expected_cvsroot)
+        self.assertEqual(norm_path, expected_path)
+
+
+class CommonSVNTestsBase(SCMTestCase):
+    """Common unit tests for Subversion.
+
+    This is meant to be subclassed for each backend that wants to run
+    the common set of tests.
+    """
+    backend = None
+    backend_name = None
     fixtures = ['test_scmtools']
 
     def setUp(self):
-        super(SubversionTests, self).setUp()
+        super(CommonSVNTestsBase, self).setUp()
+
+        self._old_backend_setting = settings.SVNTOOL_BACKENDS
+        settings.SVNTOOL_BACKENDS = [self.backend]
+        recompute_svn_backend()
 
         self.svn_repo_path = os.path.join(os.path.dirname(__file__),
                                           'testdata/svn_repo')
@@ -651,19 +754,37 @@ class SubversionTests(SCMTestCase):
         try:
             self.tool = self.repository.get_scmtool()
         except ImportError:
-            raise nose.SkipTest('Neither pysvn nor subvertpy is installed')
+            raise nose.SkipTest('The %s backend could not be used. A '
+                                'dependency may be missing.'
+                                % self.backend)
+
+        assert self.tool.client.__class__.__module__ == self.backend
+
+    def tearDown(self):
+        super(CommonSVNTestsBase, self).tearDown()
+
+        settings.SVNTOOL_BACKENDS = self._old_backend_setting
+        recompute_svn_backend()
+
+    def shortDescription(self):
+        desc = super(CommonSVNTestsBase, self).shortDescription()
+        desc = desc.replace('<backend>', self.backend_name)
+
+        return desc
 
     def test_ssh(self):
-        """Testing a SSH-backed Subversion repository"""
+        """Testing SVN (<backend>) with a SSH-backed Subversion repository"""
         self._test_ssh(self.svn_ssh_path, 'trunk/doc/misc-docs/Makefile')
 
     def test_ssh_with_site(self):
-        """Testing a SSH-backed Subversion repository with a LocalSite"""
+        """Testing SVN (<backend>) with a SSH-backed Subversion repository
+        with a LocalSite
+        """
         self._test_ssh_with_site(self.svn_ssh_path,
                                  'trunk/doc/misc-docs/Makefile')
 
     def test_get_file(self):
-        """Testing SVNTool.get_file"""
+        """Testing SVN (<backend>) get_file"""
         expected = (b'include ../tools/Makefile.base-vars\n'
                     b'NAME = misc-docs\n'
                     b'OUTNAME = svn-misc-docs\n'
@@ -695,7 +816,7 @@ class SubversionTests(SCMTestCase):
                           lambda: self.tool.get_file('hello', PRE_CREATION))
 
     def test_revision_parsing(self):
-        """Testing revision number parsing"""
+        """Testing SVN (<backend>) revision number parsing"""
         self.assertEqual(
             self.tool.parse_diff_revision('', '(working copy)')[1],
             HEAD)
@@ -733,7 +854,7 @@ class SubversionTests(SCMTestCase):
                          '7')
 
     def test_interface(self):
-        """Testing basic SVNTool API"""
+        """Testing SVN (<backend>) with basic SVNTool API"""
         self.assertEqual(self.tool.get_diffs_use_absolute_paths(), False)
 
         self.assertRaises(NotImplementedError,
@@ -743,7 +864,7 @@ class SubversionTests(SCMTestCase):
                           lambda: self.tool.get_pending_changesets(1))
 
     def test_binary_diff(self):
-        """Testing parsing SVN diff with binary file"""
+        """Testing SVN (<backend>) parsing SVN diff with binary file"""
         diff = (b'Index: binfile\n'
                 b'============================================================'
                 b'=======\n'
@@ -755,7 +876,7 @@ class SubversionTests(SCMTestCase):
         self.assertEqual(file.binary, True)
 
     def test_keyword_diff(self):
-        """Testing parsing SVN diff with keywords"""
+        """Testing SVN (<backend>) parsing diff with keywords"""
         # 'svn cat' will expand special variables in svn:keywords,
         # but 'svn diff' doesn't expand anything.  This causes the
         # patch to fail if those variables appear in the patch context.
@@ -779,7 +900,7 @@ class SubversionTests(SCMTestCase):
         patch(diff, file, filename)
 
     def test_unterminated_keyword_diff(self):
-        """Testing parsing SVN diff with unterminated keywords"""
+        """Testing SVN (<backend>) parsing diff with unterminated keywords"""
         diff = (b"Index: Makefile\n"
                 b"==========================================================="
                 b"========\n"
@@ -801,7 +922,9 @@ class SubversionTests(SCMTestCase):
         patch(diff, file, filename)
 
     def test_svn16_property_diff(self):
-        """Testing parsing SVN 1.6 diff with property changes"""
+        """Testing SVN (<backend>) parsing SVN 1.6 diff with
+        property changes
+        """
         prop_diff = (
             b"Index:\n"
             b"======================================================"
@@ -830,7 +953,9 @@ class SubversionTests(SCMTestCase):
         self.assertEqual(files[0].delete_count, 0)
 
     def test_svn17_property_diff(self):
-        """Testing parsing SVN 1.7+ diff with property changes"""
+        """Testing SVN (<backend>) parsing SVN 1.7+ diff with
+        property changes
+        """
         prop_diff = (
             b"Index .:\n"
             b"======================================================"
@@ -864,7 +989,7 @@ class SubversionTests(SCMTestCase):
         self.assertEqual(files[0].delete_count, 0)
 
     def test_unicode_diff(self):
-        """Testing parsing SVN diff with unicode characters"""
+        """Testing SVN (<backend>) parsing diff with unicode characters"""
         diff = ("Index: Filé\n"
                 "==========================================================="
                 "========\n"
@@ -884,7 +1009,7 @@ class SubversionTests(SCMTestCase):
         self.assertEqual(files[0].delete_count, 0)
 
     def test_diff_with_spaces_in_filenames(self):
-        """Testing parsing SVN diff with spaces in filenames"""
+        """Testing SVN (<backend>) parsing diff with spaces in filenames"""
         diff = (b"Index: File with spaces\n"
                 b"==========================================================="
                 b"========\n"
@@ -942,16 +1067,19 @@ class SubversionTests(SCMTestCase):
         self.assertEqual(files[0].delete_count, 0)
 
     def test_get_branches(self):
-        """Testing SVNTool.get_branches"""
+        """Testing SVN (<backend>) get_branches"""
         branches = self.tool.get_branches()
 
         self.assertEqual(len(branches), 2)
-        self.assertEqual(branches[0], Branch('trunk', '5', True))
-        self.assertEqual(branches[1], Branch('branch1', '7', False))
+        self.assertEqual(branches[0], Branch(id='trunk', name='trunk',
+                                             commit='9', default=True))
+        self.assertEqual(branches[1], Branch(id='branches/branch1',
+                                             name='branch1',
+                                             commit='7', default=False))
 
     def test_get_commits(self):
-        """Testing SVNTool.get_commits"""
-        commits = self.tool.get_commits('5')
+        """Testing SVN (<backend>) get_commits"""
+        commits = self.tool.get_commits(start='5')
 
         self.assertEqual(len(commits), 5)
         self.assertEqual(
@@ -962,7 +1090,7 @@ class SubversionTests(SCMTestCase):
                    'Add an unterminated keyword for testing bug #1523\n',
                    '4'))
 
-        commits = self.tool.get_commits('7')
+        commits = self.tool.get_commits(start='7')
         self.assertEqual(len(commits), 7)
         self.assertEqual(
             commits[1],
@@ -972,14 +1100,58 @@ class SubversionTests(SCMTestCase):
                    'Add a branches directory',
                    '5'))
 
+    def test_get_commits_with_branch(self):
+        """Testing SVN (<backend>) get_commits with branch"""
+        commits = self.tool.get_commits(branch='/branches/branch1', start='5')
+
+        self.assertEqual(len(commits), 5)
+        self.assertEqual(
+            commits[0],
+            Commit('chipx86',
+                   '5',
+                   '2010-05-21T09:33:40.893946',
+                   'Add an unterminated keyword for testing bug #1523\n',
+                   '4'))
+
+        commits = self.tool.get_commits(branch='/branches/branch1', start='7')
+        self.assertEqual(len(commits), 6)
+        self.assertEqual(
+            commits[0],
+            Commit('david',
+                   '7',
+                   '2013-06-13T07:43:27.259554',
+                   'Add a branch',
+                   '5'))
+        self.assertEqual(
+            commits[1],
+            Commit('chipx86',
+                   '5',
+                   '2010-05-21T09:33:40.893946',
+                   'Add an unterminated keyword for testing bug #1523\n',
+                   '4'))
+
     def test_get_change(self):
-        """Testing SVNTool.get_change"""
+        """Testing SVN (<backend>) get_change"""
         commit = self.tool.get_change('5')
 
         self.assertEqual(md5(commit.message.encode('utf-8')).hexdigest(),
                          '928336c082dd756e3f7af4cde4724ebf')
         self.assertEqual(md5(commit.diff.encode('utf-8')).hexdigest(),
                          '56e50374056931c03a333f234fa63375')
+
+    def test_utf8_keywords(self):
+        """Testing SVN (<backend>) with UTF-8 files with keywords"""
+        self.repository.get_file('trunk/utf8-file.txt', '9')
+
+
+class PySVNTests(CommonSVNTestsBase):
+    backend = 'reviewboard.scmtools.svn.pysvn'
+    backend_name = 'pysvn'
+
+
+class SubvertpyTests(CommonSVNTestsBase):
+    backend = 'reviewboard.scmtools.svn.subvertpy'
+    backend_name = 'subvertpy'
 
 
 class PerforceTests(SCMTestCase):
@@ -1008,6 +1180,7 @@ class PerforceTests(SCMTestCase):
         """Testing PerforceTool.get_changeset"""
         desc = self.tool.get_changeset(157)
         self.assertEqual(desc.changenum, 157)
+        self.assertEqual(type(desc.description), six.text_type)
         self.assertEqual(md5(desc.description.encode('utf-8')).hexdigest(),
                          'b7eff0ca252347cc9b09714d07397e64')
 
@@ -2187,7 +2360,7 @@ class PolicyTests(TestCase):
         self.assertTrue(self.repo.is_accessible_by(self.user))
         self.assertTrue(self.repo.is_accessible_by(self.anonymous))
 
-        self.assertTrue(self.repo in Repository.objects.accessible(self.user))
+        self.assertIn(self.repo, Repository.objects.accessible(self.user))
         self.assertTrue(
             self.repo in Repository.objects.accessible(self.anonymous))
 
@@ -2199,7 +2372,7 @@ class PolicyTests(TestCase):
         self.assertFalse(self.repo.is_accessible_by(self.user))
         self.assertFalse(self.repo.is_accessible_by(self.anonymous))
 
-        self.assertFalse(self.repo in Repository.objects.accessible(self.user))
+        self.assertNotIn(self.repo, Repository.objects.accessible(self.user))
         self.assertFalse(
             self.repo in Repository.objects.accessible(self.anonymous))
 
@@ -2212,7 +2385,7 @@ class PolicyTests(TestCase):
         self.assertTrue(self.repo.is_accessible_by(self.user))
         self.assertFalse(self.repo.is_accessible_by(self.anonymous))
 
-        self.assertTrue(self.repo in Repository.objects.accessible(self.user))
+        self.assertIn(self.repo, Repository.objects.accessible(self.user))
         self.assertFalse(
             self.repo in Repository.objects.accessible(self.anonymous))
 
@@ -2228,7 +2401,7 @@ class PolicyTests(TestCase):
         self.assertTrue(self.repo.is_accessible_by(self.user))
         self.assertFalse(self.repo.is_accessible_by(self.anonymous))
 
-        self.assertTrue(self.repo in Repository.objects.accessible(self.user))
+        self.assertIn(self.repo, Repository.objects.accessible(self.user))
         self.assertFalse(
             self.repo in Repository.objects.accessible(self.anonymous))
 
@@ -2542,7 +2715,7 @@ class RepositoryFormTests(TestCase):
         repository = form.save()
         self.assertFalse(repository.extra_data['bug_tracker_use_hosting'])
         self.assertEqual(repository.bug_tracker, 'http://example.com/issue/%s')
-        self.assertFalse('bug_tracker_type' in repository.extra_data)
+        self.assertNotIn('bug_tracker_type', repository.extra_data)
 
     def test_with_hosting_service_bug_tracker_service(self):
         """Testing RepositoryForm with a bug tracker service"""
@@ -2632,7 +2805,7 @@ class RepositoryFormTests(TestCase):
         self.assertTrue(repository.extra_data['bug_tracker_use_hosting'])
         self.assertEqual(repository.bug_tracker,
                          'http://example.com/testuser/testrepo/issue/%s')
-        self.assertFalse('bug_tracker_type' in repository.extra_data)
+        self.assertNotIn('bug_tracker_type', repository.extra_data)
         self.assertFalse('bug_tracker-test_repo_name'
                          in repository.extra_data)
         self.assertFalse('bug_tracker-hosting_account_username'
@@ -2670,7 +2843,7 @@ class RepositoryFormTests(TestCase):
         self.assertTrue(repository.extra_data['bug_tracker_use_hosting'])
         self.assertEqual(repository.bug_tracker,
                          'https://example.com/testrepo/issue/%s')
-        self.assertFalse('bug_tracker_type' in repository.extra_data)
+        self.assertNotIn('bug_tracker_type', repository.extra_data)
         self.assertFalse('bug_tracker-test_repo_name'
                          in repository.extra_data)
         self.assertFalse('bug_tracker_hosting_url'
@@ -2695,7 +2868,7 @@ class RepositoryFormTests(TestCase):
         repository = form.save()
         self.assertFalse(repository.extra_data['bug_tracker_use_hosting'])
         self.assertEqual(repository.bug_tracker, '')
-        self.assertFalse('bug_tracker_type' in repository.extra_data)
+        self.assertNotIn('bug_tracker_type', repository.extra_data)
 
     def test_with_hosting_service_with_existing_custom_bug_tracker(self):
         """Testing RepositoryForm with existing custom bug tracker"""
@@ -2723,8 +2896,8 @@ class RepositoryFormTests(TestCase):
             form._get_field_data('bug_tracker_hosting_account_username'),
             'testuser')
 
-        self.assertTrue('test' in form.bug_tracker_forms)
-        self.assertTrue('default' in form.bug_tracker_forms['test'])
+        self.assertIn('test', form.bug_tracker_forms)
+        self.assertIn('default', form.bug_tracker_forms['test'])
         bitbucket_form = form.bug_tracker_forms['test']['default']
         self.assertEqual(
             bitbucket_form.fields['test_repo_name'].initial,
